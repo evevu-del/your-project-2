@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Any
 st.set_page_config(page_title="My AI Chat", layout="wide")
 
 MODEL_ID = "google/flan-t5-small"
-TEST_MESSAGE = "Hello!"
+SYSTEM_PROMPT = "You are a helpful, concise assistant."
 
 
 def _extract_generated_text(payload: Any) -> Optional[str]:
@@ -26,10 +26,26 @@ def _extract_generated_text(payload: Any) -> Optional[str]:
     return None
 
 
-def call_hf_inference_api(*, token: str, model_id: str, message: str) -> Tuple[Optional[str], Optional[str]]:
+def build_prompt(*, system_prompt: str, messages: list[dict]) -> str:
+    lines = [system_prompt.strip(), "", "Conversation:"]
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if role == "user":
+            lines.append(f"User: {content.strip()}")
+        elif role == "assistant":
+            lines.append(f"Assistant: {content.strip()}")
+
+    lines.append("Assistant:")
+    return "\n".join(lines).strip() + "\n"
+
+
+def call_hf_inference_api(*, token: str, model_id: str, prompt: str) -> Tuple[Optional[str], Optional[str]]:
     url = f"https://api-inference.huggingface.co/models/{model_id}"
     headers = {"Authorization": f"Bearer {token}"}
-    body = {"inputs": message}
+    body = {"inputs": prompt}
 
     try:
         resp = requests.post(url, headers=headers, json=body, timeout=30)
@@ -60,7 +76,7 @@ def call_hf_inference_api(*, token: str, model_id: str, message: str) -> Tuple[O
 
 
 st.title("My AI Chat")
-st.caption("Task 1A: Page setup + Hugging Face API connection test.")
+st.caption("Task 1B: Multi-turn chat UI with Hugging Face Inference API.")
 
 try:
     token = st.secrets["HF_TOKEN"]
@@ -73,17 +89,32 @@ if not isinstance(token, str) or not token.strip():
     )
     st.stop()
 
-if "hf_test_ran" not in st.session_state:
-    st.session_state.hf_test_ran = False
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {"role": "assistant", "content": "Hi! Ask me anything."},
+    ]
 
-run_test = st.button("Send test message", type="primary") or not st.session_state.hf_test_ran
-if run_test:
-    with st.spinner(f"Sending test message to `{MODEL_ID}`..."):
-        reply, err = call_hf_inference_api(token=token.strip(), model_id=MODEL_ID, message=TEST_MESSAGE)
-    st.session_state.hf_test_ran = True
+history_box = st.container(height=520, border=True)
+with history_box:
+    for msg in st.session_state.messages:
+        role = msg.get("role", "assistant")
+        content = msg.get("content", "")
+        if role not in ("user", "assistant"):
+            continue
+        with st.chat_message(role):
+            st.write(content)
+
+user_text = st.chat_input("Type a message")
+if user_text:
+    st.session_state.messages.append({"role": "user", "content": user_text})
+
+    prompt = build_prompt(system_prompt=SYSTEM_PROMPT, messages=st.session_state.messages)
+    with st.spinner(f"Thinking with `{MODEL_ID}`..."):
+        reply, err = call_hf_inference_api(token=token.strip(), model_id=MODEL_ID, prompt=prompt)
 
     if err:
-        st.error(err)
+        st.session_state.messages.append({"role": "assistant", "content": f"Sorry — {err}"})
     else:
-        st.subheader("Model response")
-        st.write(reply)
+        st.session_state.messages.append({"role": "assistant", "content": reply})
+
+    st.rerun()
