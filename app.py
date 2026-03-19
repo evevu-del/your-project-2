@@ -19,6 +19,7 @@ CHATS_DIR = Path("chats")
 CHAT_FILE_SUFFIX = ".json"
 MEMORY_PATH = Path("memory.json")
 STREAM_RENDER_DELAY_SEC = 0.02
+HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 
 
 def _extract_generated_text(payload: Any) -> Optional[str]:
@@ -38,93 +39,89 @@ def _extract_generated_text(payload: Any) -> Optional[str]:
     return None
 
 
-def build_prompt(*, system_prompt: str, messages: list[dict]) -> str:
-    lines = [system_prompt.strip(), "", "Conversation:"]
+def build_chat_messages(*, system_prompt: str, messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    built: List[Dict[str, str]] = [{"role": "system", "content": system_prompt.strip()}]
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content")
+        if role not in ("user", "assistant"):
+            continue
         if not isinstance(content, str) or not content.strip():
             continue
-        if role == "user":
-            lines.append(f"User: {content.strip()}")
-        elif role == "assistant":
-            lines.append(f"Assistant: {content.strip()}")
-
-    lines.append("Assistant:")
-    return "\n".join(lines).strip() + "\n"
+        built.append({"role": role, "content": content.strip()})
+    return built
 
 
-def call_hf_inference_api(
+def call_hf_chat(
     *,
     token: str,
     model_id: str,
-    prompt: str,
+    messages: List[Dict[str, str]],
     parameters: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
-    url = f"https://api-inference.huggingface.co/models/{model_id}"
-    headers = {"Authorization": f"Bearer {token}"}
-    body = {
-        "inputs": prompt,
-        "parameters": parameters
-        or {
-            "max_new_tokens": 256,
-            "temperature": 0.7,
-            "return_full_text": False,
-        },
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    body: Dict[str, Any] = {
+        "model": model_id,
+        "messages": messages,
+        "stream": False,
     }
+    if parameters:
+        body.update(parameters)
 
     try:
-        resp = requests.post(url, headers=headers, json=body, timeout=60)
+        resp = requests.post(HF_ROUTER_CHAT_URL, headers=headers, json=body, timeout=60)
     except requests.RequestException as exc:
         return None, f"Network error calling Hugging Face API: {exc}"
 
-    content_type = resp.headers.get("content-type", "")
-    payload: Any = None
-    if "application/json" in content_type:
+    if resp.status_code != 200:
+        detail = resp.text.strip() if resp.text else "Unknown error"
         try:
             payload = resp.json()
+            if isinstance(payload, dict):
+                detail = str(payload.get("error") or payload.get("message") or detail)
         except ValueError:
-            payload = None
-
-    if resp.status_code != 200:
-        detail = None
-        if isinstance(payload, dict):
-            detail = payload.get("error") or payload.get("message")
-        if not isinstance(detail, str) or not detail.strip():
-            detail = resp.text.strip() if resp.text else "Unknown error"
+            pass
         return None, f"Hugging Face API error ({resp.status_code}): {detail}"
 
-    generated = _extract_generated_text(payload)
-    if generated is None:
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = None
+
+    if not isinstance(payload, dict):
         return None, "Hugging Face API returned an unexpected response format."
 
-    return generated, None
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        msg = choices[0].get("message")
+        if isinstance(msg, dict) and isinstance(msg.get("content"), str) and msg["content"].strip():
+            return msg["content"].strip(), None
+
+    return None, "Hugging Face API returned an unexpected response format."
 
 
 def stream_hf_inference_api(
     *,
     token: str,
     model_id: str,
-    prompt: str,
+    messages: List[Dict[str, str]],
     on_chunk: Callable[[str], None],
 ) -> Tuple[Optional[str], Optional[str]]:
-    url = f"https://api-inference.huggingface.co/models/{model_id}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "text/event-stream",
+        "Content-Type": "application/json",
     }
     body = {
-        "inputs": prompt,
+        "model": model_id,
+        "messages": messages,
         "stream": True,
-        "parameters": {
-            "max_new_tokens": 256,
-            "temperature": 0.7,
-            "return_full_text": False,
-        },
+        "max_tokens": 256,
+        "temperature": 0.7,
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=body, timeout=(10, 120), stream=True)
+        resp = requests.post(HF_ROUTER_CHAT_URL, headers=headers, json=body, timeout=(10, 120), stream=True)
     except requests.RequestException as exc:
         return None, f"Network error calling Hugging Face API: {exc}"
 
@@ -140,17 +137,24 @@ def stream_hf_inference_api(
             pass
         return None, f"Hugging Face API error ({resp.status_code}): {detail}"
 
-    # Fallback: some models/endpoints may not actually stream.
+    # Fallback: if the endpoint returns JSON instead of SSE.
     if "text/event-stream" not in content_type:
         try:
             payload = resp.json()
         except ValueError:
             payload = None
-        generated = _extract_generated_text(payload)
-        if generated is None:
+        if not isinstance(payload, dict):
+            return None, "Hugging Face API returned an unexpected response format."
+        choices = payload.get("choices")
+        generated = None
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            msg = choices[0].get("message")
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                generated = msg["content"]
+        if not isinstance(generated, str) or not generated.strip():
             return None, "Hugging Face API returned an unexpected response format."
         on_chunk(generated)
-        return generated, None
+        return generated.strip(), None
 
     full_text = ""
     for raw_line in resp.iter_lines(decode_unicode=True):
@@ -173,13 +177,11 @@ def stream_hf_inference_api(
 
         chunk = ""
         if isinstance(event, dict):
-            token_obj = event.get("token")
-            if isinstance(token_obj, dict) and isinstance(token_obj.get("text"), str):
-                chunk = token_obj["text"]
-            elif isinstance(event.get("generated_text"), str):
-                generated_text = event["generated_text"]
-                chunk = generated_text[len(full_text) :] if generated_text.startswith(full_text) else generated_text
-                full_text = generated_text
+            choices = event.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                delta = choices[0].get("delta")
+                if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                    chunk = delta["content"]
 
             if not chunk and isinstance(event.get("error"), str) and event["error"].strip():
                 return None, f"Hugging Face API error: {event['error'].strip()}"
@@ -259,15 +261,11 @@ def extract_memory_updates(
         f"USER MESSAGE:\n{user_message.strip()}\n"
     )
 
-    text, err = call_hf_inference_api(
+    text, err = call_hf_chat(
         token=token,
         model_id=model_id,
-        prompt=prompt,
-        parameters={
-            "max_new_tokens": 128,
-            "temperature": 0.0,
-            "return_full_text": False,
-        },
+        messages=[{"role": "system", "content": "You extract user memory."}, {"role": "user", "content": prompt}],
+        parameters={"max_tokens": 128, "temperature": 0.0},
     )
     if err:
         return {}, err
@@ -553,11 +551,11 @@ if user_text:
                 stream_state["text"] += chunk
                 response_placeholder.write(stream_state["text"])
 
-            prompt = build_prompt(system_prompt=system_prompt, messages=messages)
+            chat_messages = build_chat_messages(system_prompt=system_prompt, messages=messages)
             reply, err = stream_hf_inference_api(
                 token=token.strip(),
                 model_id=model_id.strip(),
-                prompt=prompt,
+                messages=chat_messages,
                 on_chunk=on_chunk,
             )
 
