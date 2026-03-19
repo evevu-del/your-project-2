@@ -5,8 +5,11 @@ from typing import Optional, Tuple, Any
 
 st.set_page_config(page_title="My AI Chat", layout="wide")
 
-MODEL_ID = "google/flan-t5-small"
-SYSTEM_PROMPT = "You are a helpful, concise assistant."
+DEFAULT_MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.3"
+SYSTEM_PROMPT = (
+    "You are a helpful, concise assistant. Use the conversation history to maintain context (e.g., remember the "
+    "user's name if they share it)."
+)
 
 
 def _extract_generated_text(payload: Any) -> Optional[str]:
@@ -45,7 +48,14 @@ def build_prompt(*, system_prompt: str, messages: list[dict]) -> str:
 def call_hf_inference_api(*, token: str, model_id: str, prompt: str) -> Tuple[Optional[str], Optional[str]]:
     url = f"https://api-inference.huggingface.co/models/{model_id}"
     headers = {"Authorization": f"Bearer {token}"}
-    body = {"inputs": prompt}
+    body = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 256,
+            "temperature": 0.7,
+            "return_full_text": False,
+        },
+    }
 
     try:
         resp = requests.post(url, headers=headers, json=body, timeout=30)
@@ -78,6 +88,11 @@ def call_hf_inference_api(*, token: str, model_id: str, prompt: str) -> Tuple[Op
 st.title("My AI Chat")
 st.caption("Task 1B: Multi-turn chat UI with Hugging Face Inference API.")
 
+with st.sidebar:
+    st.subheader("Settings")
+    model_id = st.text_input("Hugging Face model", value=DEFAULT_MODEL_ID)
+    st.caption("Tip: choose an instruct/chat model for better multi-turn memory.")
+
 try:
     token = st.secrets["HF_TOKEN"]
 except Exception:
@@ -109,8 +124,8 @@ if user_text:
     st.session_state.messages.append({"role": "user", "content": user_text})
 
     prompt = build_prompt(system_prompt=SYSTEM_PROMPT, messages=st.session_state.messages)
-    with st.spinner(f"Thinking with `{MODEL_ID}`..."):
-        reply, err = call_hf_inference_api(token=token.strip(), model_id=MODEL_ID, prompt=prompt)
+    with st.spinner(f"Thinking with `{model_id}`..."):
+        reply, err = call_hf_inference_api(token=token.strip(), model_id=model_id.strip(), prompt=prompt)
 
     if err:
         st.session_state.messages.append({"role": "assistant", "content": f"Sorry — {err}"})
