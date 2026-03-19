@@ -1,8 +1,9 @@
 import streamlit as st
 import requests
 import json
+import time
 from pathlib import Path
-from typing import Optional, Tuple, Any, Dict, List
+from typing import Optional, Tuple, Any, Dict, List, Callable
 from uuid import uuid4
 from datetime import datetime
 
@@ -16,6 +17,7 @@ SYSTEM_PROMPT = (
 )
 CHATS_DIR = Path("chats")
 CHAT_FILE_SUFFIX = ".json"
+STREAM_RENDER_DELAY_SEC = 0.02
 
 
 def _extract_generated_text(payload: Any) -> Optional[str]:
@@ -64,7 +66,7 @@ def call_hf_inference_api(*, token: str, model_id: str, prompt: str) -> Tuple[Op
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=body, timeout=30)
+        resp = requests.post(url, headers=headers, json=body, timeout=60)
     except requests.RequestException as exc:
         return None, f"Network error calling Hugging Face API: {exc}"
 
@@ -89,6 +91,101 @@ def call_hf_inference_api(*, token: str, model_id: str, prompt: str) -> Tuple[Op
         return None, "Hugging Face API returned an unexpected response format."
 
     return generated, None
+
+
+def stream_hf_inference_api(
+    *,
+    token: str,
+    model_id: str,
+    prompt: str,
+    on_chunk: Callable[[str], None],
+) -> Tuple[Optional[str], Optional[str]]:
+    url = f"https://api-inference.huggingface.co/models/{model_id}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "text/event-stream",
+    }
+    body = {
+        "inputs": prompt,
+        "stream": True,
+        "parameters": {
+            "max_new_tokens": 256,
+            "temperature": 0.7,
+            "return_full_text": False,
+        },
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=(10, 120), stream=True)
+    except requests.RequestException as exc:
+        return None, f"Network error calling Hugging Face API: {exc}"
+
+    content_type = resp.headers.get("content-type", "")
+
+    if resp.status_code != 200:
+        detail = resp.text.strip() if resp.text else "Unknown error"
+        try:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                detail = str(payload.get("error") or payload.get("message") or detail)
+        except ValueError:
+            pass
+        return None, f"Hugging Face API error ({resp.status_code}): {detail}"
+
+    # Fallback: some models/endpoints may not actually stream.
+    if "text/event-stream" not in content_type:
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        generated = _extract_generated_text(payload)
+        if generated is None:
+            return None, "Hugging Face API returned an unexpected response format."
+        on_chunk(generated)
+        return generated, None
+
+    full_text = ""
+    for raw_line in resp.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+
+        data = line[len("data:") :].strip()
+        if not data:
+            continue
+        if data == "[DONE]":
+            break
+
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+        chunk = ""
+        if isinstance(event, dict):
+            token_obj = event.get("token")
+            if isinstance(token_obj, dict) and isinstance(token_obj.get("text"), str):
+                chunk = token_obj["text"]
+            elif isinstance(event.get("generated_text"), str):
+                generated_text = event["generated_text"]
+                chunk = generated_text[len(full_text) :] if generated_text.startswith(full_text) else generated_text
+                full_text = generated_text
+
+            if not chunk and isinstance(event.get("error"), str) and event["error"].strip():
+                return None, f"Hugging Face API error: {event['error'].strip()}"
+
+        if chunk:
+            full_text += chunk
+            on_chunk(chunk)
+            # Ensure streaming is visible even for very fast models.
+            time.sleep(STREAM_RENDER_DELAY_SEC)
+
+    if not full_text.strip():
+        return None, "No text received from the streaming response."
+
+    return full_text, None
 
 
 def now_label() -> str:
@@ -320,9 +417,26 @@ if user_text:
         trimmed = user_text.strip().replace("\n", " ")
         active_chat["title"] = (trimmed[:32] + "…") if len(trimmed) > 33 else trimmed
 
-    prompt = build_prompt(system_prompt=SYSTEM_PROMPT, messages=messages)
-    with st.spinner(f"Thinking with `{model_id}`..."):
-        reply, err = call_hf_inference_api(token=token.strip(), model_id=model_id.strip(), prompt=prompt)
+    # Render the new user message + streamed assistant response immediately (no crash/rerun needed to see it).
+    with history_box:
+        with st.chat_message("user"):
+            st.write(user_text)
+
+        with st.chat_message("assistant"):
+            response_placeholder = st.empty()
+            stream_state = {"text": ""}
+
+            def on_chunk(chunk: str) -> None:
+                stream_state["text"] += chunk
+                response_placeholder.write(stream_state["text"])
+
+            prompt = build_prompt(system_prompt=SYSTEM_PROMPT, messages=messages)
+            reply, err = stream_hf_inference_api(
+                token=token.strip(),
+                model_id=model_id.strip(),
+                prompt=prompt,
+                on_chunk=on_chunk,
+            )
 
     if err:
         messages.append({"role": "assistant", "content": f"Sorry — {err}"})
