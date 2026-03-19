@@ -2,14 +2,21 @@
   "id": "example_chat",
   "title": "Example chat",
   "created_at": "Mar 18, 05:55 PM",
-  "updated_at": "Mar 18, 05:55 PM",
+  "updated_at": "Mar 18, 07:10 PM",
   "created_at_iso": "2026-03-18T17:55:00",
-  "updated_at_iso": "2026-03-18T17:55:00",
+  "updated_at_iso": "2026-03-18T19:10:38",
   "messages": [
     {
       "role": "assistant",
       "content": "Hi! This is an example saved chat."
+    },
+    {
+      "role": "user",
+      "content": "hi"
+    },
+    {
+      "role": "assistant",
+      "content": "Sorry — Hugging Face API error (401): Invalid username or password."
     }
   ]
 }
-
