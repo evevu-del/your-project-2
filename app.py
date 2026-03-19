@@ -62,7 +62,10 @@ def call_hf_inference_api(*, token: str, model_id: str, message: str) -> Tuple[O
 st.title("My AI Chat")
 st.caption("Task 1A: Page setup + Hugging Face API connection test.")
 
-token = st.secrets.get("HF_TOKEN") if hasattr(st, "secrets") else None
+try:
+    token = st.secrets["HF_TOKEN"]
+except Exception:
+    token = None
 if not isinstance(token, str) or not token.strip():
     st.error(
         'Missing Hugging Face token. Add `HF_TOKEN = "..."` to `.streamlit/secrets.toml` '
