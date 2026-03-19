@@ -10,7 +10,7 @@ from datetime import datetime
 
 st.set_page_config(page_title="My AI Chat", layout="wide")
 
-DEFAULT_MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.3"
+DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 SYSTEM_PROMPT = (
     "You are a helpful, concise assistant. Use the conversation history to maintain context (e.g., remember the "
     "user's name if they share it)."
