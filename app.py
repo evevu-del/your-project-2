@@ -1,5 +1,7 @@
 import streamlit as st
 import requests
+import json
+from pathlib import Path
 from typing import Optional, Tuple, Any, Dict, List
 from uuid import uuid4
 from datetime import datetime
@@ -12,6 +14,8 @@ SYSTEM_PROMPT = (
     "You are a helpful, concise assistant. Use the conversation history to maintain context (e.g., remember the "
     "user's name if they share it)."
 )
+CHATS_DIR = Path("chats")
+CHAT_FILE_SUFFIX = ".json"
 
 
 def _extract_generated_text(payload: Any) -> Optional[str]:
@@ -91,16 +95,118 @@ def now_label() -> str:
     return datetime.now().strftime("%b %d, %I:%M %p")
 
 
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
 def new_chat(*, title: str = "New chat") -> Dict[str, Any]:
     chat_id = uuid4().hex[:8]
-    ts = now_label()
+    ts_label = now_label()
+    ts_iso = now_iso()
     return {
         "id": chat_id,
         "title": title,
-        "created_at": ts,
-        "updated_at": ts,
+        "created_at": ts_label,
+        "updated_at": ts_label,
+        "created_at_iso": ts_iso,
+        "updated_at_iso": ts_iso,
         "messages": [],
     }
+
+
+def chat_path(chat_id: str) -> Path:
+    return CHATS_DIR / f"{chat_id}{CHAT_FILE_SUFFIX}"
+
+
+def persist_chat(chat: Dict[str, Any]) -> None:
+    CHATS_DIR.mkdir(parents=True, exist_ok=True)
+    chat_id = chat.get("id")
+    if not isinstance(chat_id, str) or not chat_id.strip():
+        return
+
+    path = chat_path(chat_id.strip())
+    tmp = path.with_suffix(path.suffix + ".tmp")
+
+    payload = {
+        "id": chat_id.strip(),
+        "title": chat.get("title") or "",
+        "created_at": chat.get("created_at") or "",
+        "updated_at": chat.get("updated_at") or "",
+        "created_at_iso": chat.get("created_at_iso") or "",
+        "updated_at_iso": chat.get("updated_at_iso") or "",
+        "messages": chat.get("messages") if isinstance(chat.get("messages"), list) else [],
+    }
+
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        # Avoid crashing the app if the filesystem is read-only or unavailable.
+        return
+
+
+def load_chats_from_disk() -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    CHATS_DIR.mkdir(parents=True, exist_ok=True)
+    chats: Dict[str, Dict[str, Any]] = {}
+
+    for path in sorted(CHATS_DIR.glob(f"*{CHAT_FILE_SUFFIX}")):
+        if not path.is_file():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        if not isinstance(raw, dict):
+            continue
+
+        chat_id = raw.get("id") or path.stem
+        if not isinstance(chat_id, str) or not chat_id.strip():
+            continue
+        chat_id = chat_id.strip()
+
+        messages = raw.get("messages")
+        if not isinstance(messages, list):
+            messages = []
+
+        chats[chat_id] = {
+            "id": chat_id,
+            "title": raw.get("title") or "Untitled",
+            "created_at": raw.get("created_at") or now_label(),
+            "updated_at": raw.get("updated_at") or now_label(),
+            "created_at_iso": raw.get("created_at_iso") or "",
+            "updated_at_iso": raw.get("updated_at_iso") or "",
+            "messages": messages,
+        }
+
+    def sort_key(cid: str) -> str:
+        iso = chats[cid].get("updated_at_iso")
+        return iso if isinstance(iso, str) and iso else ""
+
+    order = sorted(chats.keys(), key=sort_key, reverse=True)
+    return chats, order
+
+
+def init_state() -> None:
+    if st.session_state.get("_disk_loaded") is True:
+        return
+
+    # Migrate from older in-memory state (Part B) if present.
+    migrated_messages = st.session_state.pop("messages", None)
+
+    chats, order = load_chats_from_disk()
+    if not chats:
+        initial = new_chat(title="Chat 1")
+        if isinstance(migrated_messages, list) and migrated_messages:
+            initial["messages"] = migrated_messages
+        chats[initial["id"]] = initial
+        order = [initial["id"]]
+        persist_chat(initial)
+
+    st.session_state.chats = chats
+    st.session_state.chat_order = order
+    st.session_state.active_chat_id = st.session_state.get("active_chat_id") or (order[0] if order else None)
+    st.session_state._disk_loaded = True
 
 
 def get_active_chat() -> Optional[Dict[str, Any]]:
@@ -117,27 +223,17 @@ def get_active_chat() -> Optional[Dict[str, Any]]:
 st.title("My AI Chat")
 st.caption("Task 1C: Chat management (new/switch/delete) + multi-turn chat.")
 
+init_state()
+
 with st.sidebar:
     st.subheader("Chats")
-
-    if "chats" not in st.session_state or "chat_order" not in st.session_state or "active_chat_id" not in st.session_state:
-        st.session_state.chats = {}
-        st.session_state.chat_order = []
-
-        initial = new_chat(title="Chat 1")
-        # Migration from Part B (if present)
-        migrated_messages = st.session_state.pop("messages", None)
-        if isinstance(migrated_messages, list) and migrated_messages:
-            initial["messages"] = migrated_messages
-        st.session_state.chats[initial["id"]] = initial
-        st.session_state.chat_order.append(initial["id"])
-        st.session_state.active_chat_id = initial["id"]
 
     if st.button("New Chat", type="primary", use_container_width=True):
         chat = new_chat()
         st.session_state.chats[chat["id"]] = chat
         st.session_state.chat_order.insert(0, chat["id"])
         st.session_state.active_chat_id = chat["id"]
+        persist_chat(chat)
         st.rerun()
 
     chat_list = st.container(height=420, border=True)
@@ -164,6 +260,12 @@ with st.sidebar:
                     if st.button("✕", key=f"delete_{cid}", help="Delete chat"):
                         del st.session_state.chats[cid]
                         st.session_state.chat_order = [x for x in st.session_state.chat_order if x != cid]
+                        try:
+                            chat_path(cid).unlink()
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            pass
                         if st.session_state.active_chat_id == cid:
                             st.session_state.active_chat_id = st.session_state.chat_order[0] if st.session_state.chat_order else None
                         st.rerun()
@@ -212,6 +314,7 @@ if user_text:
     messages = active_chat["messages"]
     messages.append({"role": "user", "content": user_text})
     active_chat["updated_at"] = now_label()
+    active_chat["updated_at_iso"] = now_iso()
 
     if active_chat.get("title") in (None, "", "New chat") or str(active_chat.get("title", "")).startswith("Chat "):
         trimmed = user_text.strip().replace("\n", " ")
@@ -226,5 +329,7 @@ if user_text:
     else:
         messages.append({"role": "assistant", "content": reply})
     active_chat["updated_at"] = now_label()
+    active_chat["updated_at_iso"] = now_iso()
+    persist_chat(active_chat)
 
     st.rerun()
