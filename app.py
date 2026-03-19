@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+from typing import Optional, Tuple, Any
 
 
 st.set_page_config(page_title="My AI Chat", layout="wide")
@@ -8,7 +9,7 @@ MODEL_ID = "google/flan-t5-small"
 TEST_MESSAGE = "Hello!"
 
 
-def _extract_generated_text(payload: object) -> str | None:
+def _extract_generated_text(payload: Any) -> Optional[str]:
     if isinstance(payload, list) and payload and isinstance(payload[0], dict):
         generated_text = payload[0].get("generated_text")
         if isinstance(generated_text, str) and generated_text.strip():
@@ -25,7 +26,7 @@ def _extract_generated_text(payload: object) -> str | None:
     return None
 
 
-def call_hf_inference_api(*, token: str, model_id: str, message: str) -> tuple[str | None, str | None]:
+def call_hf_inference_api(*, token: str, model_id: str, message: str) -> Tuple[Optional[str], Optional[str]]:
     url = f"https://api-inference.huggingface.co/models/{model_id}"
     headers = {"Authorization": f"Bearer {token}"}
     body = {"inputs": message}
@@ -36,7 +37,7 @@ def call_hf_inference_api(*, token: str, model_id: str, message: str) -> tuple[s
         return None, f"Network error calling Hugging Face API: {exc}"
 
     content_type = resp.headers.get("content-type", "")
-    payload: object | None = None
+    payload: Any = None
     if "application/json" in content_type:
         try:
             payload = resp.json()
