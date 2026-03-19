@@ -17,6 +17,7 @@ SYSTEM_PROMPT = (
 )
 CHATS_DIR = Path("chats")
 CHAT_FILE_SUFFIX = ".json"
+MEMORY_PATH = Path("memory.json")
 STREAM_RENDER_DELAY_SEC = 0.02
 
 
@@ -53,12 +54,19 @@ def build_prompt(*, system_prompt: str, messages: list[dict]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def call_hf_inference_api(*, token: str, model_id: str, prompt: str) -> Tuple[Optional[str], Optional[str]]:
+def call_hf_inference_api(
+    *,
+    token: str,
+    model_id: str,
+    prompt: str,
+    parameters: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
     url = f"https://api-inference.huggingface.co/models/{model_id}"
     headers = {"Authorization": f"Bearer {token}"}
     body = {
         "inputs": prompt,
-        "parameters": {
+        "parameters": parameters
+        or {
             "max_new_tokens": 256,
             "temperature": 0.7,
             "return_full_text": False,
@@ -188,6 +196,98 @@ def stream_hf_inference_api(
     return full_text, None
 
 
+def load_memory() -> Dict[str, Any]:
+    try:
+        if not MEMORY_PATH.exists():
+            return {}
+        if MEMORY_PATH.is_dir():
+            return {}
+        raw = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_memory(memory: Dict[str, Any]) -> None:
+    try:
+        tmp = MEMORY_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(memory, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(MEMORY_PATH)
+    except OSError:
+        return
+
+
+def merge_memory(existing: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(existing)
+    for key, value in updates.items():
+        if not isinstance(key, str) or not key.strip():
+            continue
+        key = key.strip()
+
+        if value is None or value == "" or value == [] or value == {}:
+            continue
+
+        prev = merged.get(key)
+        if isinstance(prev, dict) and isinstance(value, dict):
+            merged[key] = merge_memory(prev, value)
+        elif isinstance(prev, list) and isinstance(value, list):
+            seen = set()
+            combined: List[Any] = []
+            for item in prev + value:
+                ident = json.dumps(item, sort_keys=True, ensure_ascii=False) if isinstance(item, (dict, list)) else str(item)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                combined.append(item)
+            merged[key] = combined
+        else:
+            merged[key] = value
+    return merged
+
+
+def extract_memory_updates(
+    *,
+    token: str,
+    model_id: str,
+    user_message: str,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    prompt = (
+        "Extract any personal traits, preferences, or stable user facts from the USER MESSAGE below.\n"
+        "Return ONLY a valid JSON object (no markdown, no extra text).\n"
+        "If there is nothing to extract, return {}.\n\n"
+        "Suggested keys (optional): name, preferred_language, interests (array), communication_style, favorite_topics (array).\n\n"
+        f"USER MESSAGE:\n{user_message.strip()}\n"
+    )
+
+    text, err = call_hf_inference_api(
+        token=token,
+        model_id=model_id,
+        prompt=prompt,
+        parameters={
+            "max_new_tokens": 128,
+            "temperature": 0.0,
+            "return_full_text": False,
+        },
+    )
+    if err:
+        return {}, err
+    if not isinstance(text, str) or not text.strip():
+        return {}, None
+
+    raw = text.strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {}, None
+
+    try:
+        obj = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return {}, None
+
+    return obj if isinstance(obj, dict) else {}, None
+
+
 def now_label() -> str:
     return datetime.now().strftime("%b %d, %I:%M %p")
 
@@ -303,6 +403,7 @@ def init_state() -> None:
     st.session_state.chats = chats
     st.session_state.chat_order = order
     st.session_state.active_chat_id = st.session_state.get("active_chat_id") or (order[0] if order else None)
+    st.session_state.user_memory = load_memory()
     st.session_state._disk_loaded = True
 
 
@@ -368,6 +469,21 @@ with st.sidebar:
                         st.rerun()
 
     st.divider()
+    with st.expander("User Memory", expanded=False):
+        memory = st.session_state.get("user_memory")
+        if not isinstance(memory, dict):
+            memory = {}
+            st.session_state.user_memory = memory
+        if memory:
+            st.json(memory)
+        else:
+            st.caption("No traits saved yet.")
+        if st.button("Clear / Reset Memory", use_container_width=True):
+            st.session_state.user_memory = {}
+            save_memory({})
+            st.rerun()
+
+    st.divider()
     st.subheader("Settings")
     model_id = st.text_input("Hugging Face model", value=DEFAULT_MODEL_ID)
     st.caption("Tip: choose an instruct/chat model for better multi-turn memory.")
@@ -417,7 +533,14 @@ if user_text:
         trimmed = user_text.strip().replace("\n", " ")
         active_chat["title"] = (trimmed[:32] + "…") if len(trimmed) > 33 else trimmed
 
-    # Render the new user message + streamed assistant response immediately (no crash/rerun needed to see it).
+    memory = st.session_state.get("user_memory")
+    if not isinstance(memory, dict):
+        memory = {}
+        st.session_state.user_memory = memory
+    memory_prompt = f"\n\nUser memory (JSON): {json.dumps(memory, ensure_ascii=False)}" if memory else ""
+    system_prompt = SYSTEM_PROMPT + memory_prompt
+
+    # Render the new user message + streamed assistant response immediately.
     with history_box:
         with st.chat_message("user"):
             st.write(user_text)
@@ -430,7 +553,7 @@ if user_text:
                 stream_state["text"] += chunk
                 response_placeholder.write(stream_state["text"])
 
-            prompt = build_prompt(system_prompt=SYSTEM_PROMPT, messages=messages)
+            prompt = build_prompt(system_prompt=system_prompt, messages=messages)
             reply, err = stream_hf_inference_api(
                 token=token.strip(),
                 model_id=model_id.strip(),
@@ -445,5 +568,12 @@ if user_text:
     active_chat["updated_at"] = now_label()
     active_chat["updated_at_iso"] = now_iso()
     persist_chat(active_chat)
+
+    # Task 3: extract and persist memory from the latest user message.
+    updates, mem_err = extract_memory_updates(token=token.strip(), model_id=model_id.strip(), user_message=user_text)
+    if isinstance(updates, dict) and updates:
+        merged = merge_memory(st.session_state.get("user_memory", {}), updates)
+        st.session_state.user_memory = merged
+        save_memory(merged)
 
     st.rerun()
